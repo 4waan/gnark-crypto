@@ -102,9 +102,8 @@ func (p *G1Jac) MultiExp(points []G1Affine, scalars []fr.Element, config ecc.Mul
 	}
 
 	// costPerTask is the approximate number of group ops per task; one task is one
-	// chunk, so this is the same per-chunk model bestCG1 minimises.
-	// It has to be, otherwise the split probe below would compare a window chosen
-	// under one cost model against a cost computed under another.
+	// chunk. Use the same per-chunk model that bestCG1 uses within
+	// its eligible windows, including the unweighted fallback on BW6.
 	costPerTask := msmChunkCost
 
 	// how many chunks can actually run at the same time. costFunction counts a
@@ -144,30 +143,41 @@ func (p *G1Jac) MultiExp(points []G1Affine, scalars []fr.Element, config ecc.Mul
 
 // bestCG1 returns the window size c to use for a msm of size nbPoints.
 //
-// It minimises msmCost over the window sizes that have a generated chunk
-// processor, so the returned c is always one of them; returning anything else
-// would fall through to the default branch of getChunkProcessorG1
-// and process every chunk with the wrong bucket array.
+// It first uses the unweighted model, preserving the existing Jacobian window
+// range and its tie handling. BW6 keeps that choice for every input size.
+// Once the unweighted choice uses batch affine, other curves minimise msmCost
+// among the generated batch affine windows. This keeps the fitted relative
+// weights from moving the crossover between the two chunk processors.
 //
 // The model is only an approximation and still wants verifying empirically; for
 // example on a MBP 2016, for G2 MultiExp > 8M points, hand picking c gave better
 // results.
 //
-// When several window sizes score the same, the largest is returned. Ties are
-// exact rather than an artefact of rounding: within one chunk processor, where
-// the point term carries the same weight at both window sizes, c1 < c2 tie at
-// nbPoints = (c1*2^c2 - c2*2^c1) / (c2 - c1). The model has no known bias at
-// those points, so the tie goes to the larger window because it yields fewer
-// chunks, hence fewer goroutines and channels per msm. A tie across the two
-// chunk processors is not expected, since the batch affine bucket cost has no
-// exact binary representation, and taking the larger window would be right
-// anyway.
+// Ties within the weighted batch affine regime go to the larger window, which
+// uses fewer chunks, goroutines and channels. The selector depends only on the
+// number of points, not their scalars.
 func bestCG1(nbPoints int) uint64 {
 	// implemented msmC methods (the c we use must be in this slice)
 	implementedCs := []uint64{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	C := implementedCs[0]
+	legacyC := implementedCs[0]
 	min := math.MaxFloat64
 	for _, c := range implementedCs {
+		cost := float64(fr.Bits+1) * (float64(nbPoints) + float64(uint64(1)<<c)) / float64(c)
+		if cost < min {
+			min = cost
+			legacyC = c
+		}
+	}
+	if !msmUseWeightedCost || legacyC < msmBatchAffineC {
+		return legacyC
+	}
+
+	C := legacyC
+	min = math.MaxFloat64
+	for _, c := range implementedCs {
+		if c < msmBatchAffineC {
+			continue
+		}
 		if cost := msmCost(c, nbPoints); cost <= min {
 			min = cost
 			C = c
@@ -457,9 +467,8 @@ func (p *G2Jac) MultiExp(points []G2Affine, scalars []fr.Element, config ecc.Mul
 	}
 
 	// costPerTask is the approximate number of group ops per task; one task is one
-	// chunk, so this is the same per-chunk model bestCG2 minimises.
-	// It has to be, otherwise the split probe below would compare a window chosen
-	// under one cost model against a cost computed under another.
+	// chunk. Use the same per-chunk model that bestCG2 uses within
+	// its eligible windows, including the unweighted fallback on BW6.
 	costPerTask := msmChunkCost
 
 	// how many chunks can actually run at the same time. costFunction counts a
@@ -499,30 +508,41 @@ func (p *G2Jac) MultiExp(points []G2Affine, scalars []fr.Element, config ecc.Mul
 
 // bestCG2 returns the window size c to use for a msm of size nbPoints.
 //
-// It minimises msmCost over the window sizes that have a generated chunk
-// processor, so the returned c is always one of them; returning anything else
-// would fall through to the default branch of getChunkProcessorG2
-// and process every chunk with the wrong bucket array.
+// It first uses the unweighted model, preserving the existing Jacobian window
+// range and its tie handling. BW6 keeps that choice for every input size.
+// Once the unweighted choice uses batch affine, other curves minimise msmCost
+// among the generated batch affine windows. This keeps the fitted relative
+// weights from moving the crossover between the two chunk processors.
 //
 // The model is only an approximation and still wants verifying empirically; for
 // example on a MBP 2016, for G2 MultiExp > 8M points, hand picking c gave better
 // results.
 //
-// When several window sizes score the same, the largest is returned. Ties are
-// exact rather than an artefact of rounding: within one chunk processor, where
-// the point term carries the same weight at both window sizes, c1 < c2 tie at
-// nbPoints = (c1*2^c2 - c2*2^c1) / (c2 - c1). The model has no known bias at
-// those points, so the tie goes to the larger window because it yields fewer
-// chunks, hence fewer goroutines and channels per msm. A tie across the two
-// chunk processors is not expected, since the batch affine bucket cost has no
-// exact binary representation, and taking the larger window would be right
-// anyway.
+// Ties within the weighted batch affine regime go to the larger window, which
+// uses fewer chunks, goroutines and channels. The selector depends only on the
+// number of points, not their scalars.
 func bestCG2(nbPoints int) uint64 {
 	// implemented msmC methods (the c we use must be in this slice)
 	implementedCs := []uint64{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	C := implementedCs[0]
+	legacyC := implementedCs[0]
 	min := math.MaxFloat64
 	for _, c := range implementedCs {
+		cost := float64(fr.Bits+1) * (float64(nbPoints) + float64(uint64(1)<<c)) / float64(c)
+		if cost < min {
+			min = cost
+			legacyC = c
+		}
+	}
+	if !msmUseWeightedCost || legacyC < msmBatchAffineC {
+		return legacyC
+	}
+
+	C := legacyC
+	min = math.MaxFloat64
+	for _, c := range implementedCs {
+		if c < msmBatchAffineC {
+			continue
+		}
 		if cost := msmCost(c, nbPoints); cost <= min {
 			min = cost
 			C = c
@@ -760,6 +780,11 @@ func lastC(c uint64) uint64 {
 // from the processor it is pricing.
 const msmBatchAffineC = 10
 
+// BW6 keeps the unweighted model pending measurements for its fields and
+// window sets. Other curves use the fitted weights within the batch affine
+// regime, after the unweighted selector has entered it.
+const msmUseWeightedCost = true
+
 // msmBatchSize returns the size of the batch the batch affine chunk processor
 // accumulates at window size c, or 0 for the window sizes that accumulate with
 // extended jacobian formulas. Generated from the same batch sizes as
@@ -787,13 +812,9 @@ func msmBatchSize(c uint64) int {
 // Costs below are relative to one extended jacobian bucket addition, which is
 // what the c < msmBatchAffineC chunk processor does per point.
 //
-// They are ratios of field operation mixes, so they drift with the curve and
-// with the host: a calibration, not a derivation. Both were fitted by timing
-// _innerMsm at fixed c on an Apple M2, over BLS12-381 and BN254 G1, nbPoints
-// from 1024 to 32768 and c from 8 to 13, serially and again at NbTasks 8 and
-// 16. The fit is flat, so the exact split between the two hardly matters:
-// anything from (0.5, 14) to (0.6, 10) picks the same window at every size
-// measured. Their ratio to each other is what carries the shape.
+// These historical calibration values came from fixed-window Apple M2
+// measurements of BLS12-381 and BN254 G1. Their portability still needs
+// measurements on other fields and hosts. BW6 does not use these weights.
 const (
 	// an affine bucket addition, once the batch has been inverted
 	msmAffineAddCost = 0.5
@@ -823,7 +844,11 @@ func msmBucketAddCost(c uint64) float64 {
 // counted here as 2^{c} because reducing a bucket costs an addition and a
 // doubling.
 func msmChunkCost(c uint64, nbPoints int) float64 {
-	return msmBucketAddCost(c)*float64(nbPoints) + float64(uint64(1)<<c)
+	pointCost := float64(nbPoints)
+	if msmUseWeightedCost {
+		pointCost *= msmBucketAddCost(c)
+	}
+	return pointCost + float64(uint64(1)<<c)
 }
 
 // msmCost approximates the total group operation count of a msm over nbPoints

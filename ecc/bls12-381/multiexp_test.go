@@ -34,19 +34,43 @@ func TestBestCG1(t *testing.T) {
 		return false
 	}
 
-	// bestC must return the largest window size among those minimising msmCost.
-	// Anything outside implementedCs would fall through to the default branch of
-	// getChunkProcessorG1 and silently use the wrong bucket array.
+	// Reference the previous unweighted selector, including its smaller-window
+	// tie handling. This is the compatibility boundary for the weighted model.
+	legacy := func(nbPoints int) uint64 {
+		best, C := math.MaxFloat64, implementedCs[0]
+		for _, c := range implementedCs {
+			cost := float64(fr.Bits+1) * (float64(nbPoints) + float64(uint64(1)<<c)) / float64(c)
+			if cost < best {
+				best, C = cost, c
+			}
+		}
+		return C
+	}
+
+	// Only the eligible batch affine windows use weighted minimisation.
 	assertLargestMinimiser := func(nbPoints int) {
 		t.Helper()
-		best := msmCost(implementedCs[0], nbPoints)
-		for _, c := range implementedCs[1:] {
+		oldC := legacy(nbPoints)
+		if !msmUseWeightedCost || oldC < msmBatchAffineC {
+			if got := bestCG1(nbPoints); got != oldC {
+				t.Fatalf("bestCG1(%d) = %d, want legacy window %d", nbPoints, got, oldC)
+			}
+			return
+		}
+		best := math.MaxFloat64
+		for _, c := range implementedCs {
+			if c < msmBatchAffineC {
+				continue
+			}
 			if v := msmCost(c, nbPoints); v < best {
 				best = v
 			}
 		}
 		var want uint64
 		for _, c := range implementedCs {
+			if c < msmBatchAffineC {
+				continue
+			}
 			if msmCost(c, nbPoints) == best {
 				want = c // implementedCs is ascending, so this ends on the largest
 			}
@@ -92,6 +116,13 @@ func TestBestCG1(t *testing.T) {
 			continue // the crossing does not land on an exact tie
 		}
 		assertLargestMinimiser(nbPoints)
+		if !msmUseWeightedCost || legacy(nbPoints) < msmBatchAffineC {
+			nbTies++ // the comparison above also checked legacy tie handling
+			continue
+		}
+		if c1 < msmBatchAffineC {
+			continue
+		}
 
 		// c1 and c2 cost the same here, but a third window may be cheaper than
 		// both, in which case the tie-break never gets a say
@@ -117,10 +148,6 @@ func TestBestCG1(t *testing.T) {
 	}
 }
 
-// TestBestCBatchAffineCrossoverG1 pins the fix that msmBatchAffineWeight
-// exists for: the unweighted model counted a batch-affine bucket accumulation and
-// an extended jacobian one as the same group operation, so it stayed on the
-// extended jacobian chunk processor well past the size where batch affine wins.
 // TestMsmBatchSizeG1 checks the cost model against the processor it
 // prices: msmBatchSize must report a batch exactly for the window sizes that
 // getChunkProcessorG1 sends to the batch affine path, and must
@@ -161,62 +188,21 @@ func TestMsmBatchSizeG1(t *testing.T) {
 	}
 }
 
-func TestBestCBatchAffineCrossoverG1(t *testing.T) {
-	implementedCs := []uint64{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	if implementedCs[len(implementedCs)-1] < msmBatchAffineC {
-		t.Skip("no batch affine window is generated for this curve")
-	}
-
-	// the model as it shipped before the weight was introduced
-	unweighted := func(nbPoints int) uint64 {
-		best, C := math.MaxFloat64, implementedCs[0]
-		for _, c := range implementedCs {
-			cost := float64(fr.Bits+1) * (float64(nbPoints) + float64(uint64(1)<<c)) / float64(c)
-			if cost <= best {
-				best, C = cost, c
-			}
+func TestBestCJacobianRangeG1(t *testing.T) {
+	// Retain the unweighted Jacobian range, including exact crossover ties.
+	// The fitted batch affine discount must not skip the c=9 interval.
+	for _, test := range []struct {
+		nbPoints int
+		want     uint64
+	}{
+		{768, 7}, {769, 8}, {1792, 8}, {1793, 9}, {2048, 9}, {4096, 9},
+	} {
+		if got := bestCG1(test.nbPoints); got != test.want {
+			t.Fatalf("bestCG1(%d) = %d, want %d", test.nbPoints, got, test.want)
 		}
-		return C
 	}
-
-	// both models are monotonic in nbPoints, so binary search the first size that
-	// reaches the batch affine processor
-	firstBatchAffine := func(f func(int) uint64) int {
-		lo, hi := 0, 1
-		for f(hi) < msmBatchAffineC {
-			hi *= 2
-			if hi > 1<<30 {
-				t.Fatal("no batch affine window is ever selected")
-			}
-		}
-		for lo < hi {
-			mid := lo + (hi-lo)/2
-			if f(mid) < msmBatchAffineC {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		return lo
-	}
-
-	was := firstBatchAffine(unweighted)
-	now := firstBatchAffine(bestCG1)
-	if now >= was {
-		t.Fatalf("batch affine crossover is at nbPoints=%d, no earlier than the unweighted model's %d", now, was)
-	}
-	if got := bestCG1(was); got < msmBatchAffineC {
-		t.Fatalf("bestCG1(%d) = %d, want a batch affine window", was, got)
-	}
-
-	// bestC runs before partitionScalars, so it has to assume the batch affine
-	// processor is actually taken. getChunkProcessorG1 falls back to
-	// extended jacobian when a chunk fills fewer than batchSize of its 2^{c-1}
-	// buckets, so the crossover must sit well above that threshold for the
-	// assumption to hold on non-degenerate scalars.
-	nbBuckets := 1 << (msmBatchAffineC - 1)
-	if now < 2*nbBuckets {
-		t.Fatalf("batch affine crossover at nbPoints=%d is too close to the %d buckets of a c=%d window", now, nbBuckets, msmBatchAffineC)
+	if got := bestCG1(4097); got < msmBatchAffineC {
+		t.Fatalf("bestCG1(4097) = %d, want a batch affine window", got)
 	}
 }
 
@@ -646,19 +632,43 @@ func TestBestCG2(t *testing.T) {
 		return false
 	}
 
-	// bestC must return the largest window size among those minimising msmCost.
-	// Anything outside implementedCs would fall through to the default branch of
-	// getChunkProcessorG2 and silently use the wrong bucket array.
+	// Reference the previous unweighted selector, including its smaller-window
+	// tie handling. This is the compatibility boundary for the weighted model.
+	legacy := func(nbPoints int) uint64 {
+		best, C := math.MaxFloat64, implementedCs[0]
+		for _, c := range implementedCs {
+			cost := float64(fr.Bits+1) * (float64(nbPoints) + float64(uint64(1)<<c)) / float64(c)
+			if cost < best {
+				best, C = cost, c
+			}
+		}
+		return C
+	}
+
+	// Only the eligible batch affine windows use weighted minimisation.
 	assertLargestMinimiser := func(nbPoints int) {
 		t.Helper()
-		best := msmCost(implementedCs[0], nbPoints)
-		for _, c := range implementedCs[1:] {
+		oldC := legacy(nbPoints)
+		if !msmUseWeightedCost || oldC < msmBatchAffineC {
+			if got := bestCG2(nbPoints); got != oldC {
+				t.Fatalf("bestCG2(%d) = %d, want legacy window %d", nbPoints, got, oldC)
+			}
+			return
+		}
+		best := math.MaxFloat64
+		for _, c := range implementedCs {
+			if c < msmBatchAffineC {
+				continue
+			}
 			if v := msmCost(c, nbPoints); v < best {
 				best = v
 			}
 		}
 		var want uint64
 		for _, c := range implementedCs {
+			if c < msmBatchAffineC {
+				continue
+			}
 			if msmCost(c, nbPoints) == best {
 				want = c // implementedCs is ascending, so this ends on the largest
 			}
@@ -704,6 +714,13 @@ func TestBestCG2(t *testing.T) {
 			continue // the crossing does not land on an exact tie
 		}
 		assertLargestMinimiser(nbPoints)
+		if !msmUseWeightedCost || legacy(nbPoints) < msmBatchAffineC {
+			nbTies++ // the comparison above also checked legacy tie handling
+			continue
+		}
+		if c1 < msmBatchAffineC {
+			continue
+		}
 
 		// c1 and c2 cost the same here, but a third window may be cheaper than
 		// both, in which case the tie-break never gets a say
@@ -729,10 +746,6 @@ func TestBestCG2(t *testing.T) {
 	}
 }
 
-// TestBestCBatchAffineCrossoverG2 pins the fix that msmBatchAffineWeight
-// exists for: the unweighted model counted a batch-affine bucket accumulation and
-// an extended jacobian one as the same group operation, so it stayed on the
-// extended jacobian chunk processor well past the size where batch affine wins.
 // TestMsmBatchSizeG2 checks the cost model against the processor it
 // prices: msmBatchSize must report a batch exactly for the window sizes that
 // getChunkProcessorG2 sends to the batch affine path, and must
@@ -773,62 +786,21 @@ func TestMsmBatchSizeG2(t *testing.T) {
 	}
 }
 
-func TestBestCBatchAffineCrossoverG2(t *testing.T) {
-	implementedCs := []uint64{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	if implementedCs[len(implementedCs)-1] < msmBatchAffineC {
-		t.Skip("no batch affine window is generated for this curve")
-	}
-
-	// the model as it shipped before the weight was introduced
-	unweighted := func(nbPoints int) uint64 {
-		best, C := math.MaxFloat64, implementedCs[0]
-		for _, c := range implementedCs {
-			cost := float64(fr.Bits+1) * (float64(nbPoints) + float64(uint64(1)<<c)) / float64(c)
-			if cost <= best {
-				best, C = cost, c
-			}
+func TestBestCJacobianRangeG2(t *testing.T) {
+	// Retain the unweighted Jacobian range, including exact crossover ties.
+	// The fitted batch affine discount must not skip the c=9 interval.
+	for _, test := range []struct {
+		nbPoints int
+		want     uint64
+	}{
+		{768, 7}, {769, 8}, {1792, 8}, {1793, 9}, {2048, 9}, {4096, 9},
+	} {
+		if got := bestCG2(test.nbPoints); got != test.want {
+			t.Fatalf("bestCG2(%d) = %d, want %d", test.nbPoints, got, test.want)
 		}
-		return C
 	}
-
-	// both models are monotonic in nbPoints, so binary search the first size that
-	// reaches the batch affine processor
-	firstBatchAffine := func(f func(int) uint64) int {
-		lo, hi := 0, 1
-		for f(hi) < msmBatchAffineC {
-			hi *= 2
-			if hi > 1<<30 {
-				t.Fatal("no batch affine window is ever selected")
-			}
-		}
-		for lo < hi {
-			mid := lo + (hi-lo)/2
-			if f(mid) < msmBatchAffineC {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		return lo
-	}
-
-	was := firstBatchAffine(unweighted)
-	now := firstBatchAffine(bestCG2)
-	if now >= was {
-		t.Fatalf("batch affine crossover is at nbPoints=%d, no earlier than the unweighted model's %d", now, was)
-	}
-	if got := bestCG2(was); got < msmBatchAffineC {
-		t.Fatalf("bestCG2(%d) = %d, want a batch affine window", was, got)
-	}
-
-	// bestC runs before partitionScalars, so it has to assume the batch affine
-	// processor is actually taken. getChunkProcessorG2 falls back to
-	// extended jacobian when a chunk fills fewer than batchSize of its 2^{c-1}
-	// buckets, so the crossover must sit well above that threshold for the
-	// assumption to hold on non-degenerate scalars.
-	nbBuckets := 1 << (msmBatchAffineC - 1)
-	if now < 2*nbBuckets {
-		t.Fatalf("batch affine crossover at nbPoints=%d is too close to the %d buckets of a c=%d window", now, nbBuckets, msmBatchAffineC)
+	if got := bestCG2(4097); got < msmBatchAffineC {
+		t.Fatalf("bestCG2(4097) = %d, want a batch affine window", got)
 	}
 }
 

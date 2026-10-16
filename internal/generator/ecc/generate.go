@@ -83,6 +83,11 @@ func Generate(conf config.Curve, baseDir string, gen *common.Generator) error {
 	funcs["lastC"] = lastC
 	funcs["batchSize"] = batchSize
 	funcs["batchAffineC"] = func() int { return batchAffineC }
+	funcs["weightedMsm"] = func() bool {
+		// Keep BW6's existing selector until its sparse window sets and larger
+		// fields have a measured calibration.
+		return !conf.Equal(config.BW6_761) && !conf.Equal(config.BW6_633)
+	}
 
 	funcs["nbBuckets"] = func(c int) int {
 		return 1 << (c - 1)
